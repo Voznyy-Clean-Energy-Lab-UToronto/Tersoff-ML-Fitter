@@ -31,12 +31,12 @@ LR_TERSOFF_PARAMS = 5e-4
 WEIGHT_DECAY = 0
 
 INITIAL_PARAMS = {
-    'A':         [1800.0, 3000.0, 1000.0],
-    'B':         [25.0,   300.0,  25.0],
-    'lambda1':   [2.6,    2.8,    2.6],
-    'lambda2':   [1.6,    1.9,    1.6],
-    'beta':      [1.1e-6, 1.6e-6, 1.1e-6],
-    'n':         [1.1,    0.8,    1.1]
+    'A':         [1500.0,    3295.0,    1500.0], # Pb-Pb, Pb-S, S-S
+    'B':         [20.0,      332.1,     20.0],
+    'lambda1':   [2.5,       2.7,       2.5],
+    'lambda2':   [1.5,       1.8,       1.5],
+    'beta':      [1.0e-6,    1.5724e-6, 1.0e-6],
+    'n':         [1.0,       0.78734,   1.0]
 }
 #true parameters just used for plotting as well as setting the values not being parameterized
 TRUE_PARAMS = {
@@ -185,69 +185,41 @@ class TersoffGNN(nn.Module):
             setattr(self, f"log_{param_name}_PbPb", log_values[0])
             setattr(self, f"log_{param_name}_PbS",  log_values[1])
             setattr(self, f"log_{param_name}_SS",   log_values[2])
-
         self.R_params = torch.tensor(init_params['R'], dtype=torch.float)
         self.D_params = torch.tensor(init_params['D'], dtype=torch.float)
 
     def f_c(self, r, R, D):
-        cond1 = r < (R - D)
-        cond2 = (r >= (R - D)) & (r <= R)
-
         fc_values = torch.zeros_like(r)
+        cond1 = r < (R - D)
         fc_values[cond1] = 1.0
-
+        cond2 = (r >= (R - D)) & (r < (R + D))
         R_broad = R.expand_as(r)
         D_broad = D.expand_as(r)
-
-        fc_values[cond2] = 0.5 - 0.5 * torch.sin(math.pi / 2 * (r[cond2] - R_broad[cond2]) / D_broad[cond2])
-
+        arg = math.pi * (r[cond2] - (R_broad[cond2] - D_broad[cond2])) / (2 * D_broad[cond2])
+        fc_values[cond2] = 0.5 * (1 + torch.cos(arg))
         return fc_values
 
     def forward(self, data):
-        params = {}
-        for p_name in ['A', 'B', 'lambda1', 'lambda2', 'beta', 'n']:
-            params[p_name] = torch.exp(torch.stack([
-                getattr(self, f"log_{p_name}_PbPb"),
-                getattr(self, f"log_{p_name}_PbS"),
-                getattr(self, f"log_{p_name}_SS")
-            ]))
-
+        params = {p: torch.exp(torch.stack([getattr(self, f"log_{p}_{t}") for t in ["PbPb", "PbS", "SS"]])) for p in ['A','B','lambda1','lambda2','beta','n']}
         i, j = data.edge_index
         r_ij = data.edge_attr[:, 0]
-
-        mask_PbPb = data.x[i, 0] * data.x[j, 0]
-        mask_PbS  = (data.x[i, 0] * data.x[j, 1]) + (data.x[i, 1] * data.x[j, 0])
-        mask_SS   = data.x[i, 1] * data.x[j, 1]
+        mask_PbPb=data.x[i,0]*data.x[j,0]; mask_PbS=(data.x[i,0]*data.x[j,1])+(data.x[i,1]*data.x[j,0]); mask_SS=data.x[i,1]*data.x[j,1]
         edge_param_indices = (mask_PbPb * 0 + mask_PbS * 1 + mask_SS * 2).long()
-
-        A_ij, B_ij = params['A'][edge_param_indices], params['B'][edge_param_indices]
-        lambda1_ij, lambda2_ij = params['lambda1'][edge_param_indices], params['lambda2'][edge_param_indices]
-        beta_ij, n_ij = params['beta'][edge_param_indices], params['n'][edge_param_indices]
-        R_edge, D_edge = self.R_params[edge_param_indices], self.D_params[edge_param_indices]
-
-        f_R = A_ij * torch.exp(-lambda1_ij * r_ij)
-        f_A = -B_ij * torch.exp(-lambda2_ij * r_ij)
-
+        A_ij,B_ij,l1_ij,l2_ij,beta_ij,n_ij = [params[p][edge_param_indices] for p in ['A','B','lambda1','lambda2','beta','n']]
+        R_edge = self.R_params.to(r_ij.device)[edge_param_indices]
+        D_edge = self.D_params.to(r_ij.device)[edge_param_indices]
+        f_R_raw = A_ij * torch.exp(-l1_ij * r_ij)
+        f_A_raw = -B_ij * torch.exp(-l2_ij * r_ij)
         fc_ij = self.f_c(r_ij, R_edge, D_edge)
-        f_R, f_A = f_R * fc_ij, f_A * fc_ij
-        f_R, f_A = torch.clamp(f_R, -1e4, 1e4), torch.clamp(f_A, -1e4, 1e4)
-
         sum_fc_per_atom_i = scatter_add(fc_ij, i, dim=0, dim_size=data.num_nodes)
-        zeta_ij_per_edge = torch.clamp(sum_fc_per_atom_i[i] - fc_ij, min=0)
-
-        eps = 1e-8
-        term_b = torch.pow(beta_ij * zeta_ij_per_edge + eps, n_ij)
+        zeta_ij = torch.clamp(sum_fc_per_atom_i[i] - fc_ij, min=0)
+        eps = 1e-15
+        term_b = torch.pow(beta_ij * zeta_ij + eps, n_ij)
         b_ij = torch.pow(1.0 + term_b, -1.0 / (2.0 * n_ij))
-
-        V_ij = f_R + b_ij * f_A
-
-        total_pair_energy = 0.5 * V_ij
-        total_energy = global_add_pool(total_pair_energy, data.batch[i])
-
+        V_ij = fc_ij * (f_R_raw + b_ij * f_A_raw)
+        total_energy = global_add_pool(0.5 * V_ij, data.batch[i])
         _, n_atoms_per_graph = torch.unique(data.batch, return_counts=True)
-        predicted_per_atom_energy = total_energy.squeeze(-1) / n_atoms_per_graph
-
-        return predicted_per_atom_energy
+        return total_energy.squeeze(-1) / n_atoms_per_graph
 
 
 def train_model(model, train_loader, num_epochs, lr, weight_decay, true_params):
@@ -259,9 +231,12 @@ def train_model(model, train_loader, num_epochs, lr, weight_decay, true_params):
     train_losses = []
 
     log_bounds = {
-        'A': (math.log(100), math.log(5000)), 'B': (math.log(1), math.log(1000)),
-        'lambda1': (math.log(1.0), math.log(5.0)), 'lambda2': (math.log(0.5), math.log(3.0)),
-        'beta': (math.log(1e-8), math.log(1e-4)), 'n': (math.log(0.5), math.log(1.5)),
+        'A': (math.log(100), math.log(5000)), 
+        'B': (math.log(1), math.log(1000)),
+        'lambda1': (math.log(1.0), math.log(5.0)), 
+        'lambda2': (math.log(0.5), math.log(3.0)),
+        'beta': (math.log(1e-8), math.log(1)), 
+        'n': (math.log(0.1), math.log(10))
     }
 
     # --- Helper function to calculate energy using a given parameter set ---
