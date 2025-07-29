@@ -311,22 +311,51 @@ class TersoffGNN(nn.Module):
         if num_edges == 0:
             return torch.tensor([], device=positions.device)
 
-        source_nodes, target_nodes = edge_index
-        
-        # Efficiently find angle triplets (i-j-k) to avoid memory explosion
-        source_pos = source_nodes.view(-1, 1).float()
-        edge_pairs = radius(source_pos, source_pos, r=0, max_num_neighbors=GRAPH_PARAMS['max_neighbors'])
-        
-        edge_ik_indices, edge_ij_indices = edge_pairs
-        
-        # Filter out self-pairs and duplicates
-        mask = edge_ij_indices < edge_ik_indices
-        edge_ij_indices = edge_ij_indices[mask]
-        edge_ik_indices = edge_ik_indices[mask]
+        # ==================== FIX START ====================
+        # This robust angle-finding logic replaces the original implementation
+        # that was failing silently and causing zero gradients in phases 2 & 3.
 
-        if edge_ij_indices.shape[0] == 0:
+        i_nodes, j_nodes = edge_index
+
+        # Sort all edges based on their source node `i`. This groups all outgoing
+        # edges from the same atom together. The `perm` tensor stores the 
+        # original indices of the sorted edges.
+        _, perm = torch.sort(i_nodes)
+        sorted_i = i_nodes[perm]
+
+        # Find the unique source nodes and the number of neighbors for each.
+        unique_i, counts = torch.unique_consecutive(sorted_i, return_counts=True)
+        
+        # For each source node `i` that has more than one neighbor, generate all
+        # unique pairs of its neighbors, which form the angles j-i-k.
+        edge_ij_indices_list = []
+        edge_ik_indices_list = []
+        
+        ptr = 0 # A pointer to the start of each group in the sorted list.
+        for count in counts:
+            if count > 1:
+                # These are the original indices (from `perm`) of all edges starting from the current node `i`.
+                group_edge_indices = perm[ptr : ptr + count]
+                
+                # `torch.combinations` creates all unique pairs of edge indices.
+                combs = torch.combinations(group_edge_indices, r=2)
+                
+                edge_ij_indices_list.append(combs[:, 0])
+                edge_ik_indices_list.append(combs[:, 1])
+
+            ptr += count
+        
+        # If no angles were found in the entire batch, zeta is zero and bond order is 1.
+        if not edge_ij_indices_list:
             return torch.ones(num_edges, device=positions.device)
-            
+
+        # Concatenate all found pairs into two tensors.
+        edge_ij_indices = torch.cat(edge_ij_indices_list)
+        edge_ik_indices = torch.cat(edge_ik_indices_list)
+        # ===================== FIX END =====================
+
+        source_nodes, target_nodes = edge_index
+
         # Calculate vectors and angles
         vec_ij = positions[target_nodes[edge_ij_indices]] - positions[source_nodes[edge_ij_indices]]
         vec_ik = positions[target_nodes[edge_ik_indices]] - positions[source_nodes[edge_ik_indices]]
@@ -376,8 +405,6 @@ class TersoffGNN(nn.Module):
         positions = data.pos
         edge_index = data.edge_index
         
-        # Get atom types and corresponding parameter indices
-        # *** FIX 1: Must get atom types for the entire batch ***
         batch_atom_types = torch.argmax(data.x, dim=1)
         edge_param_indices = self.interaction_map[batch_atom_types[edge_index[0]], batch_atom_types[edge_index[1]]]
 
@@ -408,14 +435,11 @@ class TersoffGNN(nn.Module):
         atomic_potential = scatter_add(0.5 * pair_energies, edge_index[0], dim=0, dim_size=data.num_nodes)
         atomic_total_energy = atomic_potential + self.E_ref[batch_atom_types]
         
-        # Sum energies for all atoms in the batch to get per-graph energies
-        # The 'data.batch' attribute tells us which atom belongs to which graph in the batch
         total_system_energy = global_add_pool(atomic_total_energy, data.batch)
 
         # Calculate forces if needed
         forces = None
         if self.training and positions.requires_grad:
-            # *** FIX 2: Removed grad_outputs for scalar output to fix shape mismatch ***
             forces = -torch.autograd.grad(
                 outputs=total_system_energy.sum(), # Sum all energies in the batch to a single scalar
                 inputs=positions,
@@ -423,7 +447,6 @@ class TersoffGNN(nn.Module):
                 retain_graph=True
             )[0]
         
-        # The model now outputs total energy for each graph in the batch
         return total_system_energy, forces
 
     def get_current_parameters(self):
@@ -461,10 +484,10 @@ def setup_initial_parameters(atom_types, interaction_pairs):
 def train_model_phase(model, optimizer, dataloader, max_epochs, patience, tolerance, phase_name, energy_weight=1.0, force_weight=0.0):
     """Train model for one phase with early stopping."""
     loss_function = nn.MSELoss()
-   
-   #SCHEDULER
+    
+    #SCHEDULER
     #scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        #optimizer, 'min', factor=0.5, patience=15, min_lr=1e-9
+    #    optimizer, 'min', factor=0.5, patience=15, min_lr=1e-9
     #)
     
     training_losses = []
@@ -488,7 +511,6 @@ def train_model_phase(model, optimizer, dataloader, max_epochs, patience, tolera
         total_force_loss = 0.0
         num_batches = 0
         
-        # *** MODIFIED: Loop over the DataLoader ***
         for batch in dataloader:
             batch = batch.to(TRAINING_CONFIG['device'])
             
@@ -573,7 +595,6 @@ def train_model_phase(model, optimizer, dataloader, max_epochs, patience, tolera
     return model, training_losses, force_rmse_history
 
 # ===== OUTPUT FUNCTIONS =====
-# (These functions remain unchanged)
 def write_tersoff_potential_file(filename, atom_types, interaction_to_index, final_params):
     """Write parameters in LAMMPS Tersoff format."""
     print(f"Writing potential file: {filename}")
@@ -892,7 +913,6 @@ def main():
     
     model.training_phase = 3
     
-    # *** MODIFIED: Train 'n' along with all other parameters for final tuning ***
     pair_param_names = ['log_A', 'log_B', 'log_lambda1', 'log_lambda2', 'E_ref']
     angular_param_names = ['log_lambda3', 'log_beta', 'log_gamma', 'log_c', 'log_d']
     n_param_name = ['log_n']
@@ -929,7 +949,6 @@ def main():
     create_force_rmse_plot(all_force_rmses, phase_labels)
     
     print("\nTraining completed successfully!")
-    print("Generated files:")
     print("  - predicted_potential.tersoff (LAMMPS format)")
     print("  - parity_plot.png (energy predictions)")
     print("  - force_parity_plot.png (force predictions)")
